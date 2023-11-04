@@ -1,0 +1,641 @@
+#!/usr/bin/env bash
+
+DEPENDENCY=()
+DEPENDENCY+=(jq)
+DEPENDENCY+=(unzip)
+DEPENDENCY+=(mkdir)
+DEPENDENCY+=(ln)
+DEPENDENCY+=(mktemp)
+DEPENDENCY+=(find)
+DEPENDENCY+=(grep)
+DEPENDENCY+=(realpath)
+
+
+REQUIRED_ENV_VARS=(
+    GID
+    UID
+)
+# create temporary folder
+SCRIPT_TEMP_DIR=""
+
+# default locations
+DATA_DIR="/data"
+ADDITIONAL_PACKS_DIR="${DATA_DIR}/additional_packs"
+WORLDS_DIR="${DATA_DIR}/worlds"
+
+ACTION=""
+EXIT_STATE=0
+
+_STATUS_INDENT=0
+_STATUS_INDENT_WIDTH=2
+_STATUS_TEXT_DEFAULT_INDENT=7 # covers INFO, WARNING, ERROR
+
+INSTALLED_ADDITIONAL_PACKS=()
+OIFS="${IFS}"
+
+function ptic {
+
+    COLOR="$1"
+    TEXT="$2"
+    CID=""
+    TTY=1
+
+    case $COLOR in
+        red)        CID="1;31" ;;
+        red_ul)     CID="4;31" ;;
+        red_inverse)CID="7;31" ;;
+        green)      CID="1;32" ;;
+        green_ul)   CID="4;32" ;;
+        yellow)     CID="1;33" ;;
+        blue)       CID="1;34" ;;
+        light_cyan) CID="1;36" ;;
+    esac
+
+    tty >/dev/null 2>&1
+    TTY=$?
+
+    # check if it's a terminal supporting colors
+    if [[ -z "$CID" ]] || [[ $TTY != 0 && $TERM != "xterm" && $TERM != "linux" && $CI != true ]]; then
+        echo -en "$TEXT"
+    elif [[ -n "$NO_COLOR" ]]; then
+        echo -en "$TEXT"
+    else
+        echo -en "\\033[${CID}m$TEXT\\033[0;39m"
+    fi
+}
+
+function print_status_line {
+    __psl_STATUS="$1"
+    __psl_STATUS_COLOR="$2"
+    __psl_STATUS_TEXT="$3"
+
+    printf -v __psl_STATUS "%-${_STATUS_TEXT_DEFAULT_INDENT}s" "$__psl_STATUS"
+    printf "[%s]: %$(((_STATUS_INDENT*_STATUS_INDENT_WIDTH)+${#__psl_STATUS_TEXT}))s\n" "$(ptic "${__psl_STATUS_COLOR}" "${__psl_STATUS}")" "$__psl_STATUS_TEXT" >&2
+}
+
+function status_indent_increase {
+    ((_STATUS_INDENT++))
+}
+
+function status_indent_decrease {
+    [[ $_STATUS_INDENT -le 0 ]] && status_indent_reset && return
+    ((_STATUS_INDENT--))
+}
+
+function status_indent_reset {
+    _STATUS_INDENT=0
+}
+
+function status_info {
+    print_status_line "INFO" "green" "$1"
+}
+
+function status_warning {
+    print_status_line "WARNING" "yellow" "$1"
+}
+
+function status_error {
+    EXIT_STATE=1
+    print_status_line "ERROR" "red" "$(ptic red "$1")"
+}
+
+function error_exit {
+    status_error "$1"
+    exit 1
+}
+
+function _mkdir {
+
+    local _DIR_TO_CREATE="$1"
+
+    mkdir -p "$_DIR_TO_CREATE" && return 0
+
+    status_error "unable te create directory: $_DIR_TO_CREATE"
+
+    return 1
+}
+
+# create the temporary directory used to store job data
+function setup_temp_directory {
+    if [[ -z "$SCRIPT_TEMP_DIR" ]]; then
+        SCRIPT_TEMP_DIR=$(mktemp -d) || exit 1
+    fi
+}
+
+# check necessary commands and ENV vars
+function check_environment {
+
+    # check presence of dependencies
+    for COMMAND in "${DEPENDENCY[@]}"; do
+        ! command -v "${COMMAND}" >/dev/null 2>&1 && \
+            status_error "command '${COMMAND}' not found, needs to be installed first."
+    done
+
+    for VAR_NAME in "${REQUIRED_ENV_VARS[@]}"; do
+        [[ -z "${!VAR_NAME}" ]] && status_error "env var '${VAR_NAME}' is empty or undefined"
+    done
+
+    [[ $EXIT_STATE -ne 0 ]] && exit 1
+}
+
+# clean up the temp folder remains
+function finish {
+
+    if [[ -n "${SCRIPT_TEMP_DIR}" && -d "${SCRIPT_TEMP_DIR}" ]]; then
+        rm -rf "${SCRIPT_TEMP_DIR}"
+        status_info "successfully deleted temp directory"
+    fi
+}
+
+function sanatize_string {
+
+    local _sas_VAR_NAME="$1"
+    #local _sas_VAR_VALUE="${!1}"
+
+    printf -v "$_sas_VAR_NAME" "%s" "${!_sas_VAR_NAME//'§'[a-z0-9]/}"
+}
+
+# caching function to speed up lookup of installed versions
+function get_installed_additional_packs {
+
+    local _giap_VAR_NAME="$1"
+    local _giap_RESULT=""
+
+    printf -v "$_giap_VAR_NAME" ""
+
+    if [[ ${#INSTALLED_ADDITIONAL_PACKS[@]} -eq 0 ]]; then
+        status_info "Looking up installed packs"
+        for ENTRY in $(find "${ADDITIONAL_PACKS_DIR}" -name manifest.json -print0 2>/dev/null | xargs -0 -n1 jq -r '(.header.uuid | ascii_downcase) + ":" + (.header.version | join("."))' 2>/dev/null); do
+            INSTALLED_ADDITIONAL_PACKS+=("$ENTRY")
+        done
+    fi
+
+    printf -v "$_giap_VAR_NAME" "%s\n" "${INSTALLED_ADDITIONAL_PACKS[@]}"
+}
+
+function add_installed_additional_pack {
+
+    local _aiap_UUID="$1"
+    local _aiap_VERSION="$2"
+
+    INSTALLED_ADDITIONAL_PACKS+=("${_aiap_UUID}:${_aiap_VERSION}")
+}
+
+function create_pack_symlink {
+
+    local _cps_PACK_SOURCE_PATH="$1"
+    local _cps_PACK_NAME="${_cps_PACK_SOURCE_PATH##*/}"
+    local _cps_PACK_DIRECTORY="${_cps_PACK_SOURCE_PATH%/*}"
+    local _cps_PACK_TYPE="${_cps_PACK_DIRECTORY##*/}"
+
+    local _cps_LINK_DESTINATION="${DATA_DIR}/${_cps_PACK_TYPE}/${_cps_PACK_NAME}"
+    local _cps_LINK_SOURCE="${_cps_PACK_SOURCE_PATH//$DATA_DIR/..}"
+
+    local _cps_LINK_ACTION="created"
+
+    status_info "setting symlink for '$_cps_PACK_SOURCE_PATH'"
+
+    if [[ -z "${_cps_PACK_SOURCE_PATH}" ]]; then
+        status_error "unable to find path '${_cps_PACK_SOURCE_PATH}'"
+        return 1
+    fi
+
+    if [[ ! -f "${_cps_PACK_SOURCE_PATH}/manifest.json" ]]; then
+        status_error "unable to find 'manifest.json' in '${_cps_PACK_SOURCE_PATH}'"
+        return 1
+    fi
+
+    if [[ -L "${_cps_LINK_DESTINATION}" ]]; then
+        if [[ $(realpath "${_cps_LINK_DESTINATION}") == "${_cps_PACK_SOURCE_PATH}" ]]; then
+            status_info "symlink up to date"
+            chown -h "$UID":"$GID" "${_cps_LINK_DESTINATION}"
+            return 0
+        else
+            status_warning "symlink of '${_cps_LINK_DESTINATION}' points to '$(realpath "${_cps_LINK_DESTINATION}")'. Updating symlink with new destination"
+            _cps_LINK_ACTION="updated"
+        fi
+    fi
+
+    ln -sfn "${_cps_LINK_SOURCE}" "${_cps_LINK_DESTINATION}" || return 1
+    chown -h "$UID":"$GID" "${_cps_LINK_DESTINATION}"
+
+    status_info "symbolic link has been ${_cps_LINK_ACTION}"
+
+    return 0
+}
+
+function add_valid_known_pack {
+
+    local _avkp_PACK_PATH="$1"
+    local _avkp_VALID_KNOWN_PACKS_FILE="${DATA_DIR}/valid_known_packs.json"
+    local _avkp_PACK_UUID=""
+    local _avkp_PACK_VERSION=""
+
+    status_info "adding pack '$_avkp_PACK_PATH' to '${_avkp_VALID_KNOWN_PACKS_FILE}'"
+
+    if [[ -z "${_avkp_PACK_PATH}" ]]; then
+        status_error "unable to find path '${_avkp_PACK_PATH}'"
+        return 1
+    fi
+
+    if [[ ! -f "${_avkp_PACK_PATH}/manifest.json" ]]; then
+        status_error "unable to find 'manifest.json' in '${_avkp_PACK_PATH}'"
+        return 1
+    fi
+
+    if [[ ! -f "${_avkp_VALID_KNOWN_PACKS_FILE}" ]]; then
+        status_error "unable to find '${_avkp_VALID_KNOWN_PACKS_FILE}'"
+        return 1
+    fi
+
+    # get pack uuid
+    _avkp_PACK_UUID=$(jq -r '.header.uuid | ascii_downcase' "${_avkp_PACK_PATH}/manifest.json") || return 1
+    _avkp_PACK_VERSION=$(jq -r '.header.version | join(".")' "${_avkp_PACK_PATH}/manifest.json") || return 1
+
+    if [[ -z "$_avkp_PACK_UUID" ]]; then
+        status_error "unable to find uuid for '$_avkp_PACK_PATH'"
+        return 1
+    fi
+    if [[ -z "$_avkp_PACK_VERSION" ]]; then
+        status_error "unable to find version for '$_avkp_PACK_PATH'"
+        return 1
+    fi
+
+    # check if pack has already been added
+    if [[ -n "$(jq '.[] | select(.uuid == "'"${_avkp_PACK_UUID}"'") | select(.version == "'"${_avkp_PACK_VERSION}"'")' ${_avkp_VALID_KNOWN_PACKS_FILE})" ]]; then
+        status_info "pack already present"
+        return 0
+    fi
+
+    IFS=$'\n'
+    # shellcheck disable=SC2044
+    for _avkp_MANIFEST in $(find "${DATA_DIR}/"{resource,behavior}_packs -follow -name manifest.json); do
+        IFS="${OIFS}"
+        if [[ "$(jq -r ".header.uuid | ascii_downcase" "${_avkp_MANIFEST}" 2>/dev/null)" == "${_avkp_PACK_UUID}" ]]; then
+            _avkp_MANIFEST_PACK_DIR_NAME="${_avkp_MANIFEST%/*}"
+            _avkp_MANIFEST_PACK_TYPE_NAME="${_avkp_MANIFEST_PACK_DIR_NAME%/*}"
+            _avkp_MANIFEST_PACK_DIR_NAME="${_avkp_MANIFEST_PACK_DIR_NAME##*/}"
+            _avkp_MANIFEST_PACK_TYPE_NAME="${_avkp_MANIFEST_PACK_TYPE_NAME##*/}"
+
+            _avkp_NEW_CONTENT=$(
+                jq '. += [
+                    {
+                        "file_system": "RawPath",
+                        "path": "'"${_avkp_MANIFEST_PACK_TYPE_NAME}"'/'"${_avkp_MANIFEST_PACK_DIR_NAME}"'",
+                        "uuid": "'"${_avkp_PACK_UUID}"'",
+                        "version": "'"${_avkp_PACK_VERSION}"'"
+                    }
+                ]' "${_avkp_VALID_KNOWN_PACKS_FILE}"
+            ) || return 1
+
+            echo "${_avkp_NEW_CONTENT}" > "${_avkp_VALID_KNOWN_PACKS_FILE}"
+
+            status_info "successfully added pack to '${_avkp_VALID_KNOWN_PACKS_FILE}'"
+            return 0
+        fi
+    done
+
+    status_warning "unable to locate pack with uuid '${_avkp_PACK_UUID}'"
+
+    return 1
+}
+
+function install_pack {
+
+    local _insp_PATH="$1"
+
+    local _insp_TYPE=""
+    local _insp_NAME=""
+    local _insp_DESCRIPTION=""
+    local _insp_VERSION=""
+    local _insp_UUID=""
+    local _insp_INSTALLED_PACKS_LIST=""
+    local _insp_DESTINATION_FOLDER_PATH=""
+
+    if [[ -z "${_insp_PATH}" ]]; then
+        status_error "unable to find path '${_insp_PATH}'"
+        return 1
+    fi
+
+    if [[ ! -f "${_insp_PATH}/manifest.json" ]]; then
+        status_error "unable to find 'manifest.json' in '${_insp_PATH}'"
+        return 1
+    fi
+
+    # get package attribures
+    _insp_TYPE=$(jq -r ".modules[0].type | ascii_downcase" "${_insp_PATH}/manifest.json")
+    _insp_NAME=$(jq -r ".header.name" "${_insp_PATH}/manifest.json")
+    _insp_DESCRIPTION=$(jq -r ".header.description" "${_insp_PATH}/manifest.json")
+    _insp_UUID=$(jq -r ".header.uuid | ascii_downcase" "${_insp_PATH}/manifest.json")
+    _insp_VERSION=$(jq -r '.header.version | join(".")' "${_insp_PATH}/manifest.json")
+
+    sanatize_string _insp_NAME
+    sanatize_string _insp_DESCRIPTION
+
+    if [[ "${_insp_TYPE}" == "resources" ]]; then
+        _insp_TYPE="resource_pack"
+    else
+        _insp_TYPE="behavior_pack"
+    fi
+
+    status_info "installing ${_insp_TYPE//_/ } '$_insp_NAME' ($_insp_VERSION)" # ($_insp_DESCRIPTION)"
+
+    # check addittional directory for already installed package
+    _mkdir "${ADDITIONAL_PACKS_DIR}" || exit 1
+
+    get_installed_additional_packs _insp_INSTALLED_PACKS_LIST
+
+    if [[ $(grep -c "${_insp_UUID}:${_insp_VERSION}$" <<< "$_insp_INSTALLED_PACKS_LIST") != 0 ]]; then
+        status_warning "${_insp_TYPE//_/ } '$_insp_NAME' in version '$_insp_VERSION' seems already installed. skipping"
+        return 1
+    fi
+
+    _insp_DESTINATION_FOLDER_PATH="${ADDITIONAL_PACKS_DIR}/${_insp_TYPE}s/${_insp_NAME//[[:space:]]/_}_${_insp_VERSION}"
+
+    # check if resource pack with this name already exists
+    if [[ -e "$_insp_DESTINATION_FOLDER_PATH" ]]; then
+        for (( I=1; I<=100; I++)); do
+            if [[ ! -e "${_insp_DESTINATION_FOLDER_PATH}_${I}" ]]; then
+                status_info "a ${_insp_TYPE//_/ } under '${_insp_DESTINATION_FOLDER_PATH}' already exists, using '${_insp_DESTINATION_FOLDER_PATH}_${I}'"
+                _insp_DESTINATION_FOLDER_PATH="${_insp_DESTINATION_FOLDER_PATH}_${I}"
+                break
+            fi
+        done
+    fi
+
+    if ! chown -R "$UID":"$GID" "${_insp_PATH}"; then
+        status_error "unable to change ownership of ${_insp_TYPE//_/ } '${_insp_NAME}'"
+        return 1
+    fi
+
+    if ! mv "${_insp_PATH}" "${_insp_DESTINATION_FOLDER_PATH}"; then
+        status_error "unable to move ${_insp_TYPE//_/ } '${_insp_NAME}' from '${_insp_PATH}' to '${_insp_DESTINATION_FOLDER_PATH}'"
+        return 1
+    fi
+
+    status_indent_increase
+    create_pack_symlink "${_insp_DESTINATION_FOLDER_PATH}" || return 1
+    add_valid_known_pack "${_insp_DESTINATION_FOLDER_PATH}" || return 1
+    status_indent_decrease
+
+    add_installed_additional_pack "${_insp_UUID}" "${_insp_VERSION}"
+}
+
+function add_minecraft_package {
+
+    local _ama_FILE_PATH="$1"
+    local _ama_FILE_TYPE="${_ama_FILE_PATH##*.}"
+    local _ama_TEMP_DIR=""
+    local _ama_UNZIP_REULST=""
+    local _ama_WORLD_NAME=""
+    local _ama_WORLD_DESTINATION_PATH=""
+
+    setup_temp_directory
+
+    _ama_TEMP_DIR="$(mktemp -d "${SCRIPT_TEMP_DIR}/${_ama_FILE_TYPE}.XXXXXX")" || exit 1
+
+    status_info "extracting '$_ama_FILE_PATH'"
+
+    if ! _ama_UNZIP_REULST=$(cd "${_ama_TEMP_DIR}" && unzip -d "${_ama_TEMP_DIR}" "${_ama_FILE_PATH}" 2>&1); then
+        status_error "issues while extarcting addon:"
+        echo "$_ama_UNZIP_REULST"
+        EXIT_STATE=1
+        return 1
+    fi
+
+    IFS=$'\n'
+    # shellcheck disable=SC2044
+    for FILE in $(find "${_ama_TEMP_DIR}/" \( -name "*.mcaddon" -o -name "*.mcpack" -o -name "*.mcworld" \) -type f 2>/dev/null); do
+        IFS="${OIFS}"
+        add_minecraft_package "$FILE"
+    done
+
+    # find manifest files for packs
+    IFS=$'\n'
+    # shellcheck disable=SC2044
+    for PACKAGE in $(find "${_ama_TEMP_DIR}/" -name "manifest.json" -maxdepth 3 -mindepth 1 -printf "%h\n" 2>/dev/null); do
+        install_pack "$PACKAGE"
+        [[ -d "$PACKAGE" ]] && rm -rf "$PACKAGE"
+    done
+
+    # add world
+    if [[ "${_ama_FILE_TYPE}" == "mcworld" ]]; then
+
+        # clean left overs
+        (cd "${_ama_TEMP_DIR}" && rm -- *.{mcaddon,mcpack,mcworld} >/dev/null 2>&1; rmdir -- *_packs >/dev/null 2>&1)
+
+        _ama_WORLD_NAME="$(cat "${_ama_TEMP_DIR}/levelname.txt")"
+        sanatize_string _ama_WORLD_NAME
+
+        status_info "adding world '${_ama_WORLD_NAME}'"
+        _ama_WORLD_DESTINATION_PATH="${WORLDS_DIR}/${_ama_WORLD_NAME//[[:space:]]/_}"
+
+        # check if resource pack with this name already exists
+        if [[ -e "$_ama_WORLD_DESTINATION_PATH" ]]; then
+            status_warning "found an already existing world with same name under '${_ama_WORLD_DESTINATION_PATH}', skipping"
+            return 1
+        fi
+
+        if ! chown -R "$UID":"$GID" "${_ama_TEMP_DIR}"; then
+            status_error "unable to change ownership of temporary world directory '${_ama_TEMP_DIR}'"
+            return 1
+        fi
+
+        if ! mv "${_ama_TEMP_DIR}" "${_ama_WORLD_DESTINATION_PATH}"; then
+            status_error "unable to move world directory from '${_ama_TEMP_DIR}' to '${_ama_WORLD_DESTINATION_PATH}'"
+            return 1
+        fi
+        status_info "successfully installed world"
+    fi
+}
+
+function list_installed_packs {
+
+    local _PACK_TYPE="$1"
+    local _PACK_MANIFEST=""
+    local _PACK_NAME=""
+    local _PACK_VERSION=""
+
+    status_indent_reset
+    status_info "Installed ${_PACK_TYPE} packs:"; status_indent_increase
+
+    find "${ADDITIONAL_PACKS_DIR}/${_PACK_TYPE}_packs/" -maxdepth 1 -type d -printf "%f\n" 2>/dev/null | while read -r LINE; do
+
+        [[ $LINE =~ ${_PACK_TYPE}_packs ]] && continue
+        _PACK_MANIFEST="${ADDITIONAL_PACKS_DIR}/${_PACK_TYPE}_packs/${LINE}/manifest.json"
+
+        [[ ! -f "$_PACK_MANIFEST" ]] && continue
+
+        _PACK_VERSION=$(jq -r '.header.version | join(".")' "${_PACK_MANIFEST}")
+        _PACK_NAME=$(jq -r ".header.name" "${_PACK_MANIFEST}")
+        sanatize_string _PACK_NAME
+
+        status_info "$(ptic light_cyan "$_PACK_NAME ($_PACK_VERSION)")"
+    done
+    ls "${ADDITIONAL_PACKS_DIR}/${_PACK_TYPE}_packs/" >/dev/null 2>&1 || status_info "NONE"
+    status_indent_decrease
+
+}
+
+function list_world_packs {
+
+    local _WORLD_DIR="$1"
+    local _PACK_TYPE="$2"
+    local _PACK=""
+    local _PACK_UUID=""
+    local _PACK_VERSON=""
+    local _PACK_NAME=""
+    local _PACK_MANIFEST=""
+
+    # get packs
+    if [[ -f "${WORLDS_DIR}/${_WORLD_DIR}/world_${_PACK_TYPE}_packs.json" ]]; then
+        status_indent_increase
+        for _PACK in $(jq -r '.[] | .pack_id + ":" + (.version | join("."))' "${WORLDS_DIR}/${_WORLD_DIR}/world_${_PACK_TYPE}_packs.json"); do
+            _PACK_UUID="${_PACK%%:*}"
+            _PACK_VERSION="${_PACK##*:}"
+            _PACK_PATH=$(jq -r '.[] | select(.uuid == "'"${_PACK_UUID}"'") | select(.version == "'"${_PACK_VERSION}"'") | .path' "${DATA_DIR}/valid_known_packs.json")
+
+            if [[ -z "${_PACK_PATH}" ]]; then
+                status_warning "unable to find installed pack with UUID '${_PACK_UUID}' and version '${_PACK_VERSION}'"
+                continue
+            fi
+            _PACK_MANIFEST="${DATA_DIR}/${_PACK_PATH}/manifest.json"
+            _PACK_NAME=$(jq -r '.header.name' "$_PACK_MANIFEST")
+            sanatize_string _PACK_NAME
+            status_info "$(ptic light_cyan "$_PACK_TYPE pack '${_PACK_NAME}' (${_PACK_VERSION})")"
+        done
+        status_indent_decrease
+    fi
+
+    return 0
+}
+
+#### commands
+function add {
+
+    local _FILE_TO_ADD="$1"
+    local _FILE_SUFFIX=""
+    local _FILE_MC_TYPE=""
+
+    # get realpath of file
+    _FILE_TO_ADD=$(realpath "$_FILE_TO_ADD")
+
+    if [[ -z "${_FILE_TO_ADD}" ]]; then
+        status_error "command add needs a resource file to be defined"
+        help
+    fi
+
+    [[ ! -e "${_FILE_TO_ADD}" ]] && error_exit "Mod '${_FILE_TO_ADD}' not found"
+
+    _FILE_SUFFIX="${_FILE_TO_ADD##*.}"
+
+    status_info "adding '$(ptic light_cyan "$_FILE_TO_ADD")'"
+
+    _mkdir "${ADDITIONAL_PACKS_DIR}" || exit 1
+
+    case $_FILE_SUFFIX in
+        mcaddon|mcpack|mcworld)
+            add_minecraft_package "${_FILE_TO_ADD}"
+            ;;
+        *)
+            error_exit "unknown file type '${_FILE_SUFFIX}'"
+            ;;
+    esac
+
+}
+
+function edit {
+    :
+}
+
+function fix {
+    :
+}
+
+function help {
+
+    cat <<EOF
+
+Script to install and manage minecraft mods and packages
+
+sub commands:
+  add    : installs *.mcpack, *.mcaddon, *.mcworld files
+  edit   : edit a worlds assigned behavior/resource packs
+  fix    : fix symlinks and valid known packs after server update
+  help   : print this help
+  list   : list installed packs and assigned packs to each world
+  remove : remove installed packs
+
+example:
+
+  mod list
+
+EOF
+
+    finish
+    exit $EXIT_STATE
+}
+
+function list {
+    local _list_NAME=""
+    local _list_VERSION=""
+    local _list_MANIFEST=""
+
+    ## resource packs
+    list_installed_packs "resource"
+
+    # bevahior packs
+    status_info " "
+    list_installed_packs "behavior"
+
+    # installed worlds
+    status_info " "
+    status_info "Existing Worlds"
+    status_indent_increase
+    find "${WORLDS_DIR}" -maxdepth 1 -printf "%f\n" 2>/dev/null | while read -r LINE; do
+        [[ ! -f "${WORLDS_DIR}/${LINE}/level.dat" ]] && continue
+        _list_NAME=$(cat "${WORLDS_DIR}/${LINE}/levelname.txt")
+        sanatize_string _list_NAME
+
+        status_info "$(ptic yellow "${_list_NAME} ($LINE)")"
+
+        list_world_packs "$LINE" behavior
+        list_world_packs "$LINE" resource
+    done
+    # shellcheck disable=SC2010
+    [[ $(ls "${WORLDS_DIR}/" 2>/dev/null | grep -c '.') -eq 0 ]] && status_info "NONE"
+    status_indent_decrease
+}
+
+function remove {
+    :
+}
+
+trap finish EXIT
+
+# first argument defines the action
+ACTION="$1"
+shift
+
+[[ -z "$ACTION" ]] && help
+
+check_environment
+
+case $ACTION in
+    add) add "$@" ;;
+    edit) edit "$@" ;;
+    fix) fix ;;
+    help) help ;;
+    list) list ;;
+    remove) remove "$@" ;;
+    *)
+        status_error "invalid action '${ACTION}'"
+        help
+    ;;
+esac
+
+finish
+
+exit $EXIT_STATE
+
+# EOF
