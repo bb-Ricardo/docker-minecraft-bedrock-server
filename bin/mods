@@ -193,7 +193,7 @@ function create_pack_symlink {
 
     local _cps_LINK_ACTION="created"
 
-    status_info "setting symlink for '$_cps_PACK_SOURCE_PATH'"
+    status_info "setting symlink for '${_cps_PACK_SOURCE_PATH//$ADDITIONAL_PACKS_DIR\//}'"
 
     if [[ -z "${_cps_PACK_SOURCE_PATH}" ]]; then
         status_error "unable to find path '${_cps_PACK_SOURCE_PATH}'"
@@ -231,7 +231,7 @@ function add_valid_known_pack {
     local _avkp_PACK_UUID=""
     local _avkp_PACK_VERSION=""
 
-    status_info "adding pack '$_avkp_PACK_PATH' to '${_avkp_VALID_KNOWN_PACKS_FILE}'"
+    status_info "adding pack '${_avkp_PACK_PATH//$ADDITIONAL_PACKS_DIR\//}' to '${_avkp_VALID_KNOWN_PACKS_FILE}'"
 
     if [[ -z "${_avkp_PACK_PATH}" ]]; then
         status_error "unable to find path '${_avkp_PACK_PATH}'"
@@ -414,6 +414,7 @@ function add_minecraft_package {
     IFS=$'\n'
     # shellcheck disable=SC2044
     for PACKAGE in $(find "${_ama_TEMP_DIR}/" -name "manifest.json" -maxdepth 3 -mindepth 1 -printf "%h\n" 2>/dev/null); do
+        IFS="${OIFS}"
         install_pack "$PACKAGE"
         [[ -d "$PACKAGE" ]] && rm -rf "$PACKAGE"
     done
@@ -549,7 +550,14 @@ function edit {
 }
 
 function fix {
-    :
+
+    IFS=$'\n'
+    # shellcheck disable=SC2044
+    for _PACK in $(find ${ADDITIONAL_PACKS_DIR} -name manifest.json -printf "%h\n"); do
+        IFS="${OIFS}"
+        create_pack_symlink "${_PACK}" || continue
+        add_valid_known_pack "${_PACK}"
+    done
 }
 
 function help {
